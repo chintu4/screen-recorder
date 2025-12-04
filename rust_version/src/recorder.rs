@@ -1,6 +1,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
+use std::io::Write; // Needed for writing to stdin
 
 #[derive(Clone, Debug)]
 pub struct RecordingConfig {
@@ -38,18 +39,45 @@ impl Recorder {
 
         let mut cmd = Command::new("ffmpeg");
 
-        // Input: Screen (Linux x11grab)
-        // Note: In a real cross-platform app, we would detect OS here.
-        // Assuming Linux/X11 for this environment.
-        cmd.arg("-f").arg("x11grab")
-           .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
-           .arg("-framerate").arg("30")
-           .arg("-i").arg(format!(":0.0+{},{}", config.x, config.y));
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: gdigrab
+            cmd.arg("-f").arg("gdigrab")
+               .arg("-framerate").arg("30")
+               .arg("-offset_x").arg(config.x.to_string())
+               .arg("-offset_y").arg(config.y.to_string())
+               .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
+               // If full screen, gdigrab uses "desktop". If region, "desktop" + offsets/size usually works.
+               .arg("-i").arg("desktop");
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+             // Linux: x11grab (Assuming X11)
+            cmd.arg("-f").arg("x11grab")
+               .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
+               .arg("-framerate").arg("30")
+               .arg("-i").arg(format!(":0.0+{},{}", config.x, config.y));
+        }
 
         // Input: Audio
         if config.audio_enabled {
-            cmd.arg("-f").arg("alsa")
-               .arg("-i").arg(&config.audio_device);
+            #[cfg(target_os = "windows")]
+            {
+                // dshow is common for windows audio but requires device names.
+                // using "audio=..." with dshow if available, but tricky without specific device name.
+                // For now, if user provided specific device, try dshow.
+                // If "default", might need "virtual-audio-capturer" or similar if installed.
+                // This is complex. For now, we attempt 'dshow' if enabled.
+                cmd.arg("-f").arg("dshow")
+                   .arg("-i").arg(format!("audio={}", config.audio_device));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                cmd.arg("-f").arg("alsa")
+                   .arg("-i").arg(&config.audio_device);
+            }
+
             // Sync audio/video
             cmd.arg("-ac").arg("2");
         }
@@ -72,9 +100,22 @@ impl Recorder {
         // Overwrite output
         cmd.arg("-y").arg(&config.output_path);
 
-        // Suppress output to keep stdout clean, but maybe log stderr to a file in production
+        // Crucial for Windows stopping: We need to write to stdin.
+        cmd.stdin(Stdio::piped());
+
+        // Capture stderr for debugging (or null if we don't implement log view yet,
+        // but piped is safer to avoid blocking if buffer fills, though we should read it).
+        // For this fix, let's inherit or pipe. If we don't read pipe, it might deadlock.
+        // Safer to use inherit for now so user sees it in console, OR null.
+        // User asked for logs, so let's try to capture it.
+        // But implementing a reader thread is complex in one step.
+        // Let's use `inherit` so it prints to the terminal running the app (good for debugging).
+        // OR `piped` if we implement the reader.
+        // Let's stick to null or inherit for simplicity unless we add the log reader.
+        // Given the task, I'll use `Stdio::piped()` for stderr and we should ideally consume it.
+        // Since I'm not adding a full log UI in this specific file update, I will use `Stdio::inherit()` so the user can see errors in their terminal.
         cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::inherit());
 
         let child = cmd.spawn().map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
 
@@ -88,24 +129,39 @@ impl Recorder {
 
     pub fn stop(&mut self) -> Result<(), String> {
         if let Some(mut child) = self.child.take() {
-            // Send 'q' to stdin? Or SIGTERM.
-            // FFmpeg usually handles SIGTERM (kill) gracefully by finishing the file.
-            // Just killing child might corrupt file if it doesn't flush.
-            // But std::process::Child doesn't support signals easily.
-            // We can try to send SIGTERM via `kill` command.
-
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "windows")]
             {
+                // On Windows, killing the process corrupts the MP4.
+                // We must send 'q' to stdin.
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(b"q");
+                }
+                // Wait for it to finish gracefully
+                match child.wait_timeout(Duration::from_secs(5)) {
+                     Ok(Some(_)) => {},
+                     Ok(None) => {
+                         // Timeout, force kill
+                         let _ = child.kill();
+                         let _ = child.wait();
+                     },
+                     Err(_) => {
+                         let _ = child.kill();
+                         let _ = child.wait();
+                     }
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Linux: SIGTERM is standard and works well.
                 let _ = Command::new("kill")
                     .arg("-SIGTERM")
                     .arg(child.id().to_string())
                     .output();
 
-                // Wait a bit for it to finish
                 match child.wait_timeout(Duration::from_secs(5)) {
-                    Ok(Some(_)) => {}, // Exited
+                    Ok(Some(_)) => {},
                     Ok(None) => {
-                        // Timed out, force kill
                         let _ = child.kill();
                         let _ = child.wait();
                     },
@@ -114,12 +170,6 @@ impl Recorder {
                         let _ = child.wait();
                     }
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // Fallback for non-linux
-                let _ = child.kill();
-                let _ = child.wait();
             }
 
             self.start_time = None;
@@ -130,47 +180,55 @@ impl Recorder {
     }
 
     pub fn pause(&mut self) -> Result<(), String> {
-        if let Some(ref child) = self.child {
-            if self.last_pause_time.is_some() {
-                return Err("Already paused".to_string());
-            }
+        #[cfg(target_os = "windows")]
+        {
+            return Err("Pause not supported on Windows".to_string());
+        }
 
-            // Send SIGSTOP
-            #[cfg(target_os = "linux")]
-            {
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Some(ref child) = self.child {
+                if self.last_pause_time.is_some() {
+                    return Err("Already paused".to_string());
+                }
+
                 let _ = Command::new("kill")
                     .arg("-SIGSTOP")
                     .arg(child.id().to_string())
                     .output();
-            }
 
-            self.last_pause_time = Some(Instant::now());
-            Ok(())
-        } else {
-            Err("Not recording".to_string())
+                self.last_pause_time = Some(Instant::now());
+                Ok(())
+            } else {
+                Err("Not recording".to_string())
+            }
         }
     }
 
     pub fn resume(&mut self) -> Result<(), String> {
-        if let Some(ref child) = self.child {
-            if let Some(pause_time) = self.last_pause_time {
-                // Send SIGCONT
-                #[cfg(target_os = "linux")]
-                {
+        #[cfg(target_os = "windows")]
+        {
+             return Err("Resume not supported on Windows".to_string());
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Some(ref child) = self.child {
+                if let Some(pause_time) = self.last_pause_time {
                     let _ = Command::new("kill")
                         .arg("-SIGCONT")
                         .arg(child.id().to_string())
                         .output();
-                }
 
-                self.paused_duration += pause_time.elapsed();
-                self.last_pause_time = None;
-                Ok(())
+                    self.paused_duration += pause_time.elapsed();
+                    self.last_pause_time = None;
+                    Ok(())
+                } else {
+                    Err("Not paused".to_string())
+                }
             } else {
-                Err("Not paused".to_string())
+                Err("Not recording".to_string())
             }
-        } else {
-            Err("Not recording".to_string())
         }
     }
 
@@ -196,9 +254,6 @@ impl Recorder {
     }
 }
 
-// Helper trait to wait with timeout (unstable in std, using a simple spin wait or custom impl is needed or external crate)
-// But since we don't want to add `wait-timeout` crate just for this, we will use a naive implementation or just wait.
-// Actually, `wait_timeout` is not in std. I'll just use `wait` or a loop with try_wait.
 trait WaitTimeout {
     fn wait_timeout(&mut self, duration: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
 }

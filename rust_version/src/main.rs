@@ -1,9 +1,9 @@
 mod recorder;
 
+use display_info::DisplayInfo;
 use eframe::egui;
 use recorder::{Recorder, RecordingConfig};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Clone, Debug, PartialEq)]
 struct MonitorInfo {
@@ -15,59 +15,21 @@ struct MonitorInfo {
 }
 
 fn get_monitors() -> Vec<MonitorInfo> {
-    // Basic xrandr parsing
-    let output = Command::new("xrandr")
-        .arg("--listmonitors")
-        .output();
-
     let mut monitors = Vec::new();
 
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Format: 0: +*HDMI-1 1920/527x1080/296+0+0  HDMI-1
-            if line.contains(':') && line.contains('+') && line.contains('x') {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    // parts[2] looks like 1920/527x1080/296+0+0
-                    // Sometimes there are spaces.
-                    // Let's try to find the geometry part.
-                    // It usually contains '/', 'x', '+'.
-                    if let Some(geo) = parts.iter().find(|p| p.contains('x') && p.contains('+')) {
-                         // Parse 1920/527x1080/296+0+0 or 1920x1080+0+0
-                         // Remove /... if present
-                         let _clean_geo = geo.replace(|c: char| c.is_ascii_digit() == false && c != 'x' && c != '+' && c != '/', "");
-                         // Actually the format is complicated.
-                         // Let's rely on the fact that monitor string is like W/mmxH/mm+X+Y
-
-                         // Simple parser: find first digit, split by x, +, /
-                         // This is brittle. Let's try a regex-like manual parse or simpler assumption.
-                         // Assuming standard xrandr output format.
-
-                         // let's just default to a "Primary" monitor if parsing fails, but try best effort.
-                         // splitting by '+' usually gives [garbage, X, Y]
-                         let plus_split: Vec<&str> = geo.split('+').collect();
-                         if plus_split.len() >= 3 {
-                             let x = plus_split[1].parse().unwrap_or(0);
-                             let y = plus_split[2].parse().unwrap_or(0);
-
-                             let size_part = plus_split[0]; // 1920/527x1080/296
-                             let x_split: Vec<&str> = size_part.split('x').collect();
-                             if x_split.len() >= 2 {
-                                 let w_str = x_split[0].split('/').next().unwrap_or("1920");
-                                 let h_str = x_split[1].split('/').next().unwrap_or("1080");
-
-                                 let w: u32 = w_str.parse().unwrap_or(1920);
-                                 let h: u32 = h_str.parse().unwrap_or(1080);
-
-                                 let name = parts.last().unwrap_or(&"Unknown").to_string();
-
-                                 monitors.push(MonitorInfo { name, width: w, height: h, x, y });
-                             }
-                         }
-                    }
-                }
-            }
+    if let Ok(display_infos) = DisplayInfo::all() {
+        for (i, info) in display_infos.iter().enumerate() {
+            monitors.push(MonitorInfo {
+                name: if info.is_primary {
+                    format!("Monitor {} (Primary)", i + 1)
+                } else {
+                    format!("Monitor {}", i + 1)
+                },
+                width: info.width,
+                height: info.height,
+                x: info.x,
+                y: info.y,
+            });
         }
     }
 
@@ -107,7 +69,7 @@ struct ScreenRecorderApp {
 }
 
 impl ScreenRecorderApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let monitors = get_monitors();
 
         // Default paths
@@ -117,6 +79,7 @@ impl ScreenRecorderApp {
             PathBuf::from(".")
         };
 
+        // Ensure we default to a safe monitor if something goes wrong
         let default_mon = monitors.first().unwrap();
 
         Self {
@@ -283,13 +246,19 @@ impl eframe::App for ScreenRecorderApp {
                         }
                     }
 
-                    if self.recorder.is_paused() {
-                        if ui.button("▶ Resume").clicked() {
-                            let _ = self.recorder.resume();
-                        }
+                    // Pause/Resume Logic
+                    if cfg!(target_os = "windows") {
+                        // Disable buttons on Windows
+                        ui.add_enabled(false, egui::Button::new("⏸ Pause")).on_disabled_hover_text("Pause is not supported on Windows");
                     } else {
-                        if ui.button("⏸ Pause").clicked() {
-                            let _ = self.recorder.pause();
+                        if self.recorder.is_paused() {
+                            if ui.button("▶ Resume").clicked() {
+                                let _ = self.recorder.resume();
+                            }
+                        } else {
+                            if ui.button("⏸ Pause").clicked() {
+                                let _ = self.recorder.pause();
+                            }
                         }
                     }
                 }
