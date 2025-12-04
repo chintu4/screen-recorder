@@ -56,7 +56,8 @@ struct ScreenRecorderApp {
     filename: String,
     format: String, // "mp4", "webm"
     audio_enabled: bool,
-    audio_device: String,
+    audio_devices: Vec<String>,
+    selected_audio_device: String,
 
     // Region state
     region_custom: bool,
@@ -82,6 +83,10 @@ impl ScreenRecorderApp {
         // Ensure we default to a safe monitor if something goes wrong
         let default_mon = monitors.first().unwrap();
 
+        // Initial audio scan
+        let audio_devices = recorder::get_audio_devices();
+        let selected_audio_device = audio_devices.first().cloned().unwrap_or_else(|| "default".to_string());
+
         Self {
             recorder: Recorder::new(),
             monitors: monitors.clone(),
@@ -90,13 +95,23 @@ impl ScreenRecorderApp {
             filename: "recording.mp4".to_string(),
             format: "mp4".to_string(),
             audio_enabled: false,
-            audio_device: "default".to_string(),
+            audio_devices,
+            selected_audio_device,
             region_custom: false,
             reg_x: default_mon.x,
             reg_y: default_mon.y,
             reg_w: default_mon.width,
             reg_h: default_mon.height,
             status_message: "Ready".to_string(),
+        }
+    }
+
+    fn refresh_audio_devices(&mut self) {
+        self.audio_devices = recorder::get_audio_devices();
+        if !self.audio_devices.contains(&self.selected_audio_device) {
+             if let Some(first) = self.audio_devices.first() {
+                 self.selected_audio_device = first.clone();
+             }
         }
     }
 }
@@ -182,9 +197,20 @@ impl eframe::App for ScreenRecorderApp {
                     if self.audio_enabled {
                         ui.horizontal(|ui| {
                             ui.label("Device:");
-                            ui.text_edit_singleline(&mut self.audio_device);
+                            egui::ComboBox::from_id_source("audio_combo")
+                                .selected_text(&self.selected_audio_device)
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for dev in &self.audio_devices {
+                                        ui.selectable_value(&mut self.selected_audio_device, dev.clone(), dev);
+                                    }
+                                });
+
+                            if ui.button("🔄").on_hover_text("Refresh Devices").clicked() {
+                                self.refresh_audio_devices();
+                            }
                         });
-                        ui.small("Hint: 'default' or 'hw:0,0' (ALSA)");
+                        ui.small("Select your input device (e.g., Microphone)");
                     }
                 });
 
@@ -229,7 +255,7 @@ impl eframe::App for ScreenRecorderApp {
                             x: self.reg_x,
                             y: self.reg_y,
                             audio_enabled: self.audio_enabled,
-                            audio_device: self.audio_device.clone(),
+                            audio_device: self.selected_audio_device.clone(),
                             container_format: self.format.clone(),
                         };
 

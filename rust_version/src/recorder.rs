@@ -11,7 +11,7 @@ pub struct RecordingConfig {
     pub x: i32,
     pub y: i32,
     pub audio_enabled: bool,
-    pub audio_device: String, // e.g., "default" or "hw:0,0"
+    pub audio_device: String, // e.g., "default" or "Microphone (Realtek Audio)"
     pub container_format: String, // "mp4", "webm"
 }
 
@@ -20,6 +20,59 @@ pub struct Recorder {
     start_time: Option<Instant>,
     paused_duration: Duration,
     last_pause_time: Option<Instant>,
+}
+
+pub fn get_audio_devices() -> Vec<String> {
+    let mut devices = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Run ffmpeg -list_devices true -f dshow -i dummy
+        // The output is in stderr.
+        let output = Command::new("ffmpeg")
+            .arg("-list_devices").arg("true")
+            .arg("-f").arg("dshow")
+            .arg("-i").arg("dummy")
+            .output();
+
+        if let Ok(output) = output {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut in_audio_section = false;
+            for line in stderr.lines() {
+                if line.contains("DirectShow video devices") {
+                    in_audio_section = false;
+                } else if line.contains("DirectShow audio devices") {
+                    in_audio_section = true;
+                } else if in_audio_section {
+                    // Lines look like:
+                    // [dshow @ ...]  "Microphone (Realtek Audio)"
+                    // [dshow @ ...]     Alternative name "..."
+                    if let Some(start_quote) = line.find('"') {
+                        if let Some(end_quote) = line[start_quote+1..].find('"') {
+                             let device_name = &line[start_quote+1..start_quote+1+end_quote];
+                             // Avoid "Alternative name" lines usually
+                             if !line.contains("Alternative name") {
+                                 devices.push(device_name.to_string());
+                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Linux: for now just return "default" and maybe some common ones
+        devices.push("default".to_string());
+        devices.push("hw:0,0".to_string());
+    }
+
+    if devices.is_empty() {
+        devices.push("default".to_string());
+    }
+
+    devices
 }
 
 impl Recorder {
