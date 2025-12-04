@@ -118,6 +118,10 @@ impl Recorder {
             #[cfg(target_os = "windows")]
             {
                 // dshow is common for windows audio but requires device names.
+                // using "audio=..." with dshow if available, but tricky without specific device name.
+                // For now, if user provided specific device, try dshow.
+                // If "default", might need "virtual-audio-capturer" or similar if installed.
+                // This is complex. For now, we attempt 'dshow' if enabled.
                 cmd.arg("-f").arg("dshow")
                    .arg("-i").arg(format!("audio={}", config.audio_device));
             }
