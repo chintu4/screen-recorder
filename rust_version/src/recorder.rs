@@ -1,7 +1,15 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use std::io::Write; // Needed for writing to stdin
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecordingMode {
+    Screen,
+    Camera,
+    PiP, // Screen + Camera
+}
 
 #[derive(Clone, Debug)]
 pub struct RecordingConfig {
@@ -10,6 +18,8 @@ pub struct RecordingConfig {
     pub height: u32,
     pub x: i32,
     pub y: i32,
+    pub mode: RecordingMode,
+    pub camera_device: String,
     pub audio_enabled: bool,
     pub audio_device: String, // e.g., "default" or "hw:0,0"
     pub container_format: String, // "mp4", "webm"
@@ -39,36 +49,66 @@ impl Recorder {
 
         let mut cmd = Command::new("ffmpeg");
 
-        #[cfg(target_os = "windows")]
-        {
-            // Windows: gdigrab
-            cmd.arg("-f").arg("gdigrab")
-               .arg("-framerate").arg("30")
-               .arg("-offset_x").arg(config.x.to_string())
-               .arg("-offset_y").arg(config.y.to_string())
-               .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
-               // If full screen, gdigrab uses "desktop". If region, "desktop" + offsets/size usually works.
-               .arg("-i").arg("desktop");
+        // --- Input 1: Desktop / Primary Video Source ---
+        match config.mode {
+            RecordingMode::Screen | RecordingMode::PiP => {
+                #[cfg(target_os = "windows")]
+                {
+                    // Windows: gdigrab
+                    cmd.arg("-f").arg("gdigrab")
+                       .arg("-framerate").arg("30")
+                       .arg("-offset_x").arg(config.x.to_string())
+                       .arg("-offset_y").arg(config.y.to_string())
+                       .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
+                       .arg("-i").arg("desktop");
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                     // Linux: x11grab (Assuming X11)
+                    cmd.arg("-f").arg("x11grab")
+                       .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
+                       .arg("-framerate").arg("30")
+                       .arg("-i").arg(format!(":0.0+{},{}", config.x, config.y));
+                }
+            },
+            RecordingMode::Camera => {
+                // If Camera only mode, the camera is the primary input [0:v]
+                #[cfg(target_os = "windows")]
+                {
+                    cmd.arg("-f").arg("dshow")
+                       .arg("-i").arg(format!("video={}", config.camera_device));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    cmd.arg("-f").arg("v4l2")
+                       .arg("-framerate").arg("30")
+                       .arg("-video_size").arg("640x480") // Default safe resolution
+                       .arg("-i").arg(&config.camera_device);
+                }
+            }
         }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-             // Linux: x11grab (Assuming X11)
-            cmd.arg("-f").arg("x11grab")
-               .arg("-video_size").arg(format!("{}x{}", config.width, config.height))
-               .arg("-framerate").arg("30")
-               .arg("-i").arg(format!(":0.0+{},{}", config.x, config.y));
+        // --- Input 2: Camera (Only for PiP) ---
+        if config.mode == RecordingMode::PiP {
+             #[cfg(target_os = "windows")]
+             {
+                 cmd.arg("-f").arg("dshow")
+                    .arg("-video_size").arg("320x240") // Fixed small size for PiP
+                    .arg("-i").arg(format!("video={}", config.camera_device));
+             }
+             #[cfg(not(target_os = "windows"))]
+             {
+                 cmd.arg("-f").arg("v4l2")
+                    .arg("-framerate").arg("30")
+                    .arg("-video_size").arg("320x240")
+                    .arg("-i").arg(&config.camera_device);
+             }
         }
 
-        // Input: Audio
+        // --- Input 3 (or 2): Audio ---
         if config.audio_enabled {
             #[cfg(target_os = "windows")]
             {
-                // dshow is common for windows audio but requires device names.
-                // using "audio=..." with dshow if available, but tricky without specific device name.
-                // For now, if user provided specific device, try dshow.
-                // If "default", might need "virtual-audio-capturer" or similar if installed.
-                // This is complex. For now, we attempt 'dshow' if enabled.
                 cmd.arg("-f").arg("dshow")
                    .arg("-i").arg(format!("audio={}", config.audio_device));
             }
@@ -77,9 +117,15 @@ impl Recorder {
                 cmd.arg("-f").arg("alsa")
                    .arg("-i").arg(&config.audio_device);
             }
-
-            // Sync audio/video
             cmd.arg("-ac").arg("2");
+        }
+
+        // --- Filter Complex (For PiP) ---
+        if config.mode == RecordingMode::PiP {
+            // [0:v] is desktop, [1:v] is camera
+            // Overlay camera on desktop at top right with 10px padding
+            // main_w - overlay_w - 10 : 10
+            cmd.arg("-filter_complex").arg("[0:v][1:v] overlay=main_w-overlay_w-10:10");
         }
 
         // Encoding options
@@ -92,8 +138,10 @@ impl Recorder {
             _ => { // default mp4
                 cmd.arg("-c:v").arg("libx264")
                    .arg("-preset").arg("ultrafast") // fast encoding for real-time
-                   .arg("-crf").arg("23")
-                   .arg("-pix_fmt").arg("yuv420p"); // compatible with most players
+                   .arg("-crf").arg("23");
+
+                // Ensure pixel format is valid (yuv420p is safe)
+                cmd.arg("-pix_fmt").arg("yuv420p");
             }
         }
 
@@ -103,17 +151,7 @@ impl Recorder {
         // Crucial for Windows stopping: We need to write to stdin.
         cmd.stdin(Stdio::piped());
 
-        // Capture stderr for debugging (or null if we don't implement log view yet,
-        // but piped is safer to avoid blocking if buffer fills, though we should read it).
-        // For this fix, let's inherit or pipe. If we don't read pipe, it might deadlock.
-        // Safer to use inherit for now so user sees it in console, OR null.
-        // User asked for logs, so let's try to capture it.
-        // But implementing a reader thread is complex in one step.
-        // Let's use `inherit` so it prints to the terminal running the app (good for debugging).
-        // OR `piped` if we implement the reader.
-        // Let's stick to null or inherit for simplicity unless we add the log reader.
-        // Given the task, I'll use `Stdio::piped()` for stderr and we should ideally consume it.
-        // Since I'm not adding a full log UI in this specific file update, I will use `Stdio::inherit()` so the user can see errors in their terminal.
+        // Use inherit so user sees ffmpeg logs in terminal
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::inherit());
 
