@@ -23,20 +23,10 @@ sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbc
 ```
 
 ## Running
-
-### Linux
 ```bash
 cd rust_version
 cargo run --release
 ```
-
-### Windows
-1. Install `ffmpeg` and ensure it is in your system PATH.
-2. Download `rust_version.exe` or build it yourself:
-   ```bash
-   cargo build --target x86_64-pc-windows-gnu --release
-   ```
-3. Run `rust_version.exe`.
 
 ## Development
 This project uses:

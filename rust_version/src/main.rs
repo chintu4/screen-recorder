@@ -15,89 +15,73 @@ struct MonitorInfo {
 }
 
 fn get_monitors() -> Vec<MonitorInfo> {
-    #[cfg(target_os = "linux")]
-    {
-        // Basic xrandr parsing for Linux
-        let output = Command::new("xrandr").arg("--listmonitors").output();
+    // Basic xrandr parsing
+    let output = Command::new("xrandr")
+        .arg("--listmonitors")
+        .output();
 
-        let mut monitors = Vec::new();
+    let mut monitors = Vec::new();
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                // Format: 0: +*HDMI-1 1920/527x1080/296+0+0  HDMI-1
-                if line.contains(':') && line.contains('+') && line.contains('x') {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        if let Some(geo) = parts.iter().find(|p| p.contains('x') && p.contains('+'))
-                        {
-                            let plus_split: Vec<&str> = geo.split('+').collect();
-                            if plus_split.len() >= 3 {
-                                let x = plus_split[1].parse().unwrap_or(0);
-                                let y = plus_split[2].parse().unwrap_or(0);
+    if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Format: 0: +*HDMI-1 1920/527x1080/296+0+0  HDMI-1
+            if line.contains(':') && line.contains('+') && line.contains('x') {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    // parts[2] looks like 1920/527x1080/296+0+0
+                    // Sometimes there are spaces.
+                    // Let's try to find the geometry part.
+                    // It usually contains '/', 'x', '+'.
+                    if let Some(geo) = parts.iter().find(|p| p.contains('x') && p.contains('+')) {
+                         // Parse 1920/527x1080/296+0+0 or 1920x1080+0+0
+                         // Remove /... if present
+                         let _clean_geo = geo.replace(|c: char| c.is_ascii_digit() == false && c != 'x' && c != '+' && c != '/', "");
+                         // Actually the format is complicated.
+                         // Let's rely on the fact that monitor string is like W/mmxH/mm+X+Y
 
-                                let size_part = plus_split[0];
-                                let x_split: Vec<&str> = size_part.split('x').collect();
-                                if x_split.len() >= 2 {
-                                    let w_str = x_split[0].split('/').next().unwrap_or("1920");
-                                    let h_str = x_split[1].split('/').next().unwrap_or("1080");
+                         // Simple parser: find first digit, split by x, +, /
+                         // This is brittle. Let's try a regex-like manual parse or simpler assumption.
+                         // Assuming standard xrandr output format.
 
-                                    let w: u32 = w_str.parse().unwrap_or(1920);
-                                    let h: u32 = h_str.parse().unwrap_or(1080);
+                         // let's just default to a "Primary" monitor if parsing fails, but try best effort.
+                         // splitting by '+' usually gives [garbage, X, Y]
+                         let plus_split: Vec<&str> = geo.split('+').collect();
+                         if plus_split.len() >= 3 {
+                             let x = plus_split[1].parse().unwrap_or(0);
+                             let y = plus_split[2].parse().unwrap_or(0);
 
-                                    let name = parts.last().unwrap_or(&"Unknown").to_string();
+                             let size_part = plus_split[0]; // 1920/527x1080/296
+                             let x_split: Vec<&str> = size_part.split('x').collect();
+                             if x_split.len() >= 2 {
+                                 let w_str = x_split[0].split('/').next().unwrap_or("1920");
+                                 let h_str = x_split[1].split('/').next().unwrap_or("1080");
 
-                                    monitors.push(MonitorInfo {
-                                        name,
-                                        width: w,
-                                        height: h,
-                                        x,
-                                        y,
-                                    });
-                                }
-                            }
-                        }
+                                 let w: u32 = w_str.parse().unwrap_or(1920);
+                                 let h: u32 = h_str.parse().unwrap_or(1080);
+
+                                 let name = parts.last().unwrap_or(&"Unknown").to_string();
+
+                                 monitors.push(MonitorInfo { name, width: w, height: h, x, y });
+                             }
+                         }
                     }
                 }
             }
         }
-
-        if monitors.is_empty() {
-            monitors.push(MonitorInfo {
-                name: "Default (Full Screen)".to_string(),
-                width: 1920,
-                height: 1080,
-                x: 0,
-                y: 0,
-            });
-        }
-        return monitors;
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, return a single "Primary/Full Desktop" monitor.
-        // gdigrab with -i desktop captures the entire virtual desktop.
-        // Region selection is supported via -offset_x/-offset_y/-video_size.
-        vec![MonitorInfo {
-            name: "Primary/Full Desktop".to_string(),
-            width: 1920, // Default fallback. Users can customize region.
-            height: 1080,
-            x: 0,
-            y: 0,
-        }]
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        vec![MonitorInfo {
-            name: "Default".to_string(),
+    if monitors.is_empty() {
+        monitors.push(MonitorInfo {
+            name: "Default (Full Screen)".to_string(),
             width: 1920,
             height: 1080,
             x: 0,
             y: 0,
-        }]
+        });
     }
+
+    monitors
 }
 
 struct ScreenRecorderApp {
@@ -111,7 +95,6 @@ struct ScreenRecorderApp {
     format: String, // "mp4", "webm"
     audio_enabled: bool,
     audio_device: String,
-    ffmpeg_path: String,
 
     // Region state
     region_custom: bool,
@@ -129,24 +112,12 @@ impl ScreenRecorderApp {
 
         // Default paths
         let output_dir = if let Some(user_dirs) = directories::UserDirs::new() {
-            user_dirs
-                .video_dir()
-                .unwrap_or(user_dirs.home_dir())
-                .to_path_buf()
+            user_dirs.video_dir().unwrap_or(user_dirs.home_dir()).to_path_buf()
         } else {
             PathBuf::from(".")
         };
 
         let default_mon = monitors.first().unwrap();
-
-        // Detect FFmpeg
-        let ffmpeg_path = if std::path::Path::new("ffmpeg.exe").exists() {
-            "ffmpeg.exe".to_string()
-        } else if std::path::Path::new("ffmpeg").exists() {
-            "./ffmpeg".to_string()
-        } else {
-            "ffmpeg".to_string()
-        };
 
         Self {
             recorder: Recorder::new(),
@@ -157,7 +128,6 @@ impl ScreenRecorderApp {
             format: "mp4".to_string(),
             audio_enabled: false,
             audio_device: "default".to_string(),
-            ffmpeg_path,
             region_custom: false,
             reg_x: default_mon.x,
             reg_y: default_mon.y,
@@ -178,20 +148,13 @@ impl eframe::App for ScreenRecorderApp {
             ui.horizontal(|ui| {
                 ui.label("Status: ");
                 let duration = self.recorder.get_duration();
-                let time_str = format!(
-                    "{:02}:{:02}",
-                    duration.as_secs() / 60,
-                    duration.as_secs() % 60
-                );
+                let time_str = format!("{:02}:{:02}", duration.as_secs() / 60, duration.as_secs() % 60);
 
                 if self.recorder.is_recording() {
                     if self.recorder.is_paused() {
                         ui.colored_label(egui::Color32::YELLOW, format!("Paused ({})", time_str));
                     } else {
-                        ui.colored_label(
-                            egui::Color32::RED,
-                            format!("Recording... ({})", time_str),
-                        );
+                        ui.colored_label(egui::Color32::RED, format!("Recording... ({})", time_str));
                         ctx.request_repaint(); // Animation
                     }
                 } else {
@@ -204,28 +167,9 @@ impl eframe::App for ScreenRecorderApp {
             }
             ui.separator();
 
-            // FFmpeg Configuration
-            ui.add_enabled_ui(!self.recorder.is_recording(), |ui| {
-                ui.collapsing("FFmpeg Configuration", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Path:");
-                        ui.text_edit_singleline(&mut self.ffmpeg_path);
-                        if ui.button("Select...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Executables", &["exe", ""])
-                                .pick_file()
-                            {
-                                self.ffmpeg_path = path.to_string_lossy().to_string();
-                            }
-                        }
-                    });
-                    ui.small("If not in PATH, select the ffmpeg executable manually.");
-                });
-            });
-            ui.separator();
-
             // Settings (Disable if recording)
             ui.add_enabled_ui(!self.recorder.is_recording(), |ui| {
+
                 // Monitor Selection
                 ui.horizontal(|ui| {
                     ui.label("Monitor:");
@@ -233,14 +177,7 @@ impl eframe::App for ScreenRecorderApp {
                         .selected_text(&self.monitors[self.selected_monitor_index].name)
                         .show_ui(ui, |ui| {
                             for (i, mon) in self.monitors.iter().enumerate() {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.selected_monitor_index,
-                                        i,
-                                        &mon.name,
-                                    )
-                                    .clicked()
-                                {
+                                if ui.selectable_value(&mut self.selected_monitor_index, i, &mon.name).clicked() {
                                     // Reset region to monitor if not custom
                                     if !self.region_custom {
                                         self.reg_x = mon.x;
@@ -258,16 +195,12 @@ impl eframe::App for ScreenRecorderApp {
                     ui.checkbox(&mut self.region_custom, "Custom Region");
                     if self.region_custom {
                         ui.horizontal(|ui| {
-                            ui.label("X:");
-                            ui.add(egui::DragValue::new(&mut self.reg_x));
-                            ui.label("Y:");
-                            ui.add(egui::DragValue::new(&mut self.reg_y));
+                            ui.label("X:"); ui.add(egui::DragValue::new(&mut self.reg_x));
+                            ui.label("Y:"); ui.add(egui::DragValue::new(&mut self.reg_y));
                         });
                         ui.horizontal(|ui| {
-                            ui.label("W:");
-                            ui.add(egui::DragValue::new(&mut self.reg_w));
-                            ui.label("H:");
-                            ui.add(egui::DragValue::new(&mut self.reg_h));
+                            ui.label("W:"); ui.add(egui::DragValue::new(&mut self.reg_w));
+                            ui.label("H:"); ui.add(egui::DragValue::new(&mut self.reg_h));
                         });
                     }
                     if ui.button("Reset to Monitor Size").clicked() {
@@ -288,10 +221,7 @@ impl eframe::App for ScreenRecorderApp {
                             ui.label("Device:");
                             ui.text_edit_singleline(&mut self.audio_device);
                         });
-                        #[cfg(target_os = "linux")]
                         ui.small("Hint: 'default' or 'hw:0,0' (ALSA)");
-                        #[cfg(target_os = "windows")]
-                        ui.small("Hint: 'virtual-audio-capturer' or device name (dshow)");
                     }
                 });
 
@@ -315,16 +245,8 @@ impl eframe::App for ScreenRecorderApp {
                         egui::ComboBox::from_id_source("fmt_combo")
                             .selected_text(&self.format)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.format,
-                                    "mp4".to_string(),
-                                    "MP4 (H.264)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.format,
-                                    "webm".to_string(),
-                                    "WebM (VP9)",
-                                );
+                                ui.selectable_value(&mut self.format, "mp4".to_string(), "MP4 (H.264)");
+                                ui.selectable_value(&mut self.format, "webm".to_string(), "WebM (VP9)");
                             });
                     });
                 });
@@ -346,7 +268,6 @@ impl eframe::App for ScreenRecorderApp {
                             audio_enabled: self.audio_enabled,
                             audio_device: self.audio_device.clone(),
                             container_format: self.format.clone(),
-                            ffmpeg_path: self.ffmpeg_path.clone(),
                         };
 
                         match self.recorder.start(&config) {
@@ -364,29 +285,19 @@ impl eframe::App for ScreenRecorderApp {
 
                     if self.recorder.is_paused() {
                         if ui.button("▶ Resume").clicked() {
-                            match self.recorder.resume() {
-                                Ok(_) => {}
-                                Err(e) => self.status_message = format!("Error: {}", e),
-                            }
+                            let _ = self.recorder.resume();
                         }
                     } else {
-                        // Pause only works on Linux for now
-                        #[cfg(target_os = "linux")]
                         if ui.button("⏸ Pause").clicked() {
-                            match self.recorder.pause() {
-                                Ok(_) => {}
-                                Err(e) => self.status_message = format!("Error: {}", e),
-                            }
+                            let _ = self.recorder.pause();
                         }
-                        #[cfg(not(target_os = "linux"))]
-                        ui.add_enabled(false, egui::Button::new("⏸ Pause"));
                     }
                 }
             });
 
             // Add Open Folder button
             if !self.recorder.is_recording() && ui.button("Open Output Folder").clicked() {
-                let _ = open::that(&self.output_dir);
+                 let _ = open::that(&self.output_dir);
             }
         });
     }
