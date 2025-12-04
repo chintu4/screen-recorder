@@ -1,8 +1,10 @@
 mod recorder;
+mod device_list;
 
 use display_info::DisplayInfo;
 use eframe::egui;
-use recorder::{Recorder, RecordingConfig};
+use recorder::{Recorder, RecordingConfig, RecordingMode};
+use device_list::{Device, get_video_devices, get_audio_devices};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,7 +53,12 @@ struct ScreenRecorderApp {
     monitors: Vec<MonitorInfo>,
     selected_monitor_index: usize,
 
+    // Devices
+    video_devices: Vec<Device>,
+    audio_devices: Vec<Device>,
+
     // Config state
+    mode: RecordingMode,
     output_dir: PathBuf,
     filename: String,
     format: String, // "mp4", "webm"
@@ -72,6 +79,8 @@ struct ScreenRecorderApp {
 impl ScreenRecorderApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let monitors = get_monitors();
+        let video_devices = get_video_devices();
+        let audio_devices = get_audio_devices();
 
         // Default paths
         let output_dir = if let Some(user_dirs) = directories::UserDirs::new() {
@@ -91,6 +100,9 @@ impl ScreenRecorderApp {
             recorder: Recorder::new(),
             monitors: monitors.clone(),
             selected_monitor_index: 0,
+            video_devices,
+            audio_devices,
+            mode: RecordingMode::Screen,
             output_dir,
             filename: "recording.mp4".to_string(),
             format: "mp4".to_string(),
@@ -148,48 +160,84 @@ impl eframe::App for ScreenRecorderApp {
             // Settings (Disable if recording)
             ui.add_enabled_ui(!self.recorder.is_recording(), |ui| {
 
-                // Monitor Selection
+                // Mode Selection
                 ui.horizontal(|ui| {
-                    ui.label("Monitor:");
-                    egui::ComboBox::from_id_source("monitor_combo")
-                        .selected_text(&self.monitors[self.selected_monitor_index].name)
+                    ui.label("Mode:");
+                    egui::ComboBox::from_id_source("mode_combo")
+                        .selected_text(match self.mode {
+                            RecordingMode::Screen => "Screen Only",
+                            RecordingMode::Camera => "Camera Only",
+                            RecordingMode::PiP => "Screen + Camera",
+                        })
                         .show_ui(ui, |ui| {
-                            for (i, mon) in self.monitors.iter().enumerate() {
-                                if ui.selectable_value(&mut self.selected_monitor_index, i, &mon.name).clicked() {
-                                    // Reset region to monitor if not custom
-                                    if !self.region_custom {
-                                        self.reg_x = mon.x;
-                                        self.reg_y = mon.y;
-                                        self.reg_w = mon.width;
-                                        self.reg_h = mon.height;
-                                    }
-                                }
-                            }
+                            ui.selectable_value(&mut self.mode, RecordingMode::Screen, "Screen Only");
+                            ui.selectable_value(&mut self.mode, RecordingMode::Camera, "Camera Only");
+                            ui.selectable_value(&mut self.mode, RecordingMode::PiP, "Screen + Camera");
                         });
                 });
 
-                // Region Selection
-                ui.collapsing("Region / Crop", |ui| {
-                    ui.checkbox(&mut self.region_custom, "Custom Region");
-                    if self.region_custom {
-                        ui.horizontal(|ui| {
-                            ui.label("X:"); ui.add(egui::DragValue::new(&mut self.reg_x));
-                            ui.label("Y:"); ui.add(egui::DragValue::new(&mut self.reg_y));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("W:"); ui.add(egui::DragValue::new(&mut self.reg_w));
-                            ui.label("H:"); ui.add(egui::DragValue::new(&mut self.reg_h));
-                        });
-                    }
-                    if ui.button("Reset to Monitor Size").clicked() {
-                        let mon = &self.monitors[self.selected_monitor_index];
-                        self.reg_x = mon.x;
-                        self.reg_y = mon.y;
-                        self.reg_w = mon.width;
-                        self.reg_h = mon.height;
-                        self.region_custom = false;
-                    }
-                });
+                // Monitor Selection (Only for Screen modes)
+                if self.mode != RecordingMode::Camera {
+                    ui.horizontal(|ui| {
+                        ui.label("Monitor:");
+                        egui::ComboBox::from_id_source("monitor_combo")
+                            .selected_text(&self.monitors[self.selected_monitor_index].name)
+                            .show_ui(ui, |ui| {
+                                for (i, mon) in self.monitors.iter().enumerate() {
+                                    if ui.selectable_value(&mut self.selected_monitor_index, i, &mon.name).clicked() {
+                                        // Reset region to monitor if not custom
+                                        if !self.region_custom {
+                                            self.reg_x = mon.x;
+                                            self.reg_y = mon.y;
+                                            self.reg_w = mon.width;
+                                            self.reg_h = mon.height;
+                                        }
+                                    }
+                                }
+                            });
+                    });
+
+                    // Region Selection
+                    ui.collapsing("Region / Crop", |ui| {
+                        ui.checkbox(&mut self.region_custom, "Custom Region");
+                        if self.region_custom {
+                            ui.horizontal(|ui| {
+                                ui.label("X:"); ui.add(egui::DragValue::new(&mut self.reg_x));
+                                ui.label("Y:"); ui.add(egui::DragValue::new(&mut self.reg_y));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("W:"); ui.add(egui::DragValue::new(&mut self.reg_w));
+                                ui.label("H:"); ui.add(egui::DragValue::new(&mut self.reg_h));
+                            });
+                        }
+                        if ui.button("Reset to Monitor Size").clicked() {
+                            let mon = &self.monitors[self.selected_monitor_index];
+                            self.reg_x = mon.x;
+                            self.reg_y = mon.y;
+                            self.reg_w = mon.width;
+                            self.reg_h = mon.height;
+                            self.region_custom = false;
+                        }
+                    });
+                }
+
+                // Camera Selection (Only for Camera or PiP modes)
+                if self.mode != RecordingMode::Screen {
+                    ui.horizontal(|ui| {
+                        ui.label("Camera:");
+                        if self.video_devices.is_empty() {
+                            ui.colored_label(egui::Color32::RED, "No cameras found");
+                        } else {
+                            egui::ComboBox::from_id_source("camera_combo")
+                                .selected_text(&self.video_devices[self.selected_video_device_index].name)
+                                .show_ui(ui, |ui| {
+                                    for (i, dev) in self.video_devices.iter().enumerate() {
+                                        ui.selectable_value(&mut self.selected_video_device_index, i, &dev.name);
+                                    }
+                                });
+                        }
+                    });
+                }
 
                 // Audio
                 ui.collapsing("Audio", |ui| {
@@ -246,14 +294,37 @@ impl eframe::App for ScreenRecorderApp {
             // Controls
             ui.horizontal(|ui| {
                 if !self.recorder.is_recording() {
-                    if ui.button("🔴 Record").clicked() {
+                    let can_record = if self.mode != RecordingMode::Screen && self.video_devices.is_empty() {
+                        false
+                    } else if self.audio_enabled && self.audio_devices.is_empty() {
+                        false
+                    } else {
+                        true
+                    };
+
+                    if ui.add_enabled(can_record, egui::Button::new("🔴 Record")).clicked() {
                         let path = self.output_dir.join(&self.filename);
+
+                        let camera_dev = if !self.video_devices.is_empty() {
+                            self.video_devices[self.selected_video_device_index].id.clone()
+                        } else {
+                            String::new()
+                        };
+
+                        let audio_dev = if !self.audio_devices.is_empty() {
+                             self.audio_devices[self.selected_audio_device_index].id.clone()
+                        } else {
+                             "default".to_string()
+                        };
+
                         let config = RecordingConfig {
                             output_path: path.clone(),
                             width: self.reg_w,
                             height: self.reg_h,
                             x: self.reg_x,
                             y: self.reg_y,
+                            mode: self.mode.clone(),
+                            camera_device: camera_dev,
                             audio_enabled: self.audio_enabled,
                             audio_device: self.selected_audio_device.clone(),
                             container_format: self.format.clone(),
@@ -263,6 +334,10 @@ impl eframe::App for ScreenRecorderApp {
                             Ok(_) => self.status_message = format!("Recording to {:?}", path),
                             Err(e) => self.status_message = format!("Error: {}", e),
                         }
+                    }
+
+                    if !can_record {
+                        ui.small("Missing required devices");
                     }
                 } else {
                     if ui.button("⏹ Stop").clicked() {
@@ -304,7 +379,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 450.0])
+            .with_inner_size([400.0, 500.0])
             .with_min_inner_size([300.0, 300.0]),
         ..Default::default()
     };
