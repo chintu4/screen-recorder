@@ -1,9 +1,9 @@
 mod recorder;
 
+use display_info::DisplayInfo;
 use eframe::egui;
 use recorder::{Recorder, RecordingConfig};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Clone, Debug, PartialEq)]
 struct MonitorInfo {
@@ -15,59 +15,21 @@ struct MonitorInfo {
 }
 
 fn get_monitors() -> Vec<MonitorInfo> {
-    // Basic xrandr parsing
-    let output = Command::new("xrandr")
-        .arg("--listmonitors")
-        .output();
-
     let mut monitors = Vec::new();
 
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Format: 0: +*HDMI-1 1920/527x1080/296+0+0  HDMI-1
-            if line.contains(':') && line.contains('+') && line.contains('x') {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    // parts[2] looks like 1920/527x1080/296+0+0
-                    // Sometimes there are spaces.
-                    // Let's try to find the geometry part.
-                    // It usually contains '/', 'x', '+'.
-                    if let Some(geo) = parts.iter().find(|p| p.contains('x') && p.contains('+')) {
-                         // Parse 1920/527x1080/296+0+0 or 1920x1080+0+0
-                         // Remove /... if present
-                         let _clean_geo = geo.replace(|c: char| c.is_ascii_digit() == false && c != 'x' && c != '+' && c != '/', "");
-                         // Actually the format is complicated.
-                         // Let's rely on the fact that monitor string is like W/mmxH/mm+X+Y
-
-                         // Simple parser: find first digit, split by x, +, /
-                         // This is brittle. Let's try a regex-like manual parse or simpler assumption.
-                         // Assuming standard xrandr output format.
-
-                         // let's just default to a "Primary" monitor if parsing fails, but try best effort.
-                         // splitting by '+' usually gives [garbage, X, Y]
-                         let plus_split: Vec<&str> = geo.split('+').collect();
-                         if plus_split.len() >= 3 {
-                             let x = plus_split[1].parse().unwrap_or(0);
-                             let y = plus_split[2].parse().unwrap_or(0);
-
-                             let size_part = plus_split[0]; // 1920/527x1080/296
-                             let x_split: Vec<&str> = size_part.split('x').collect();
-                             if x_split.len() >= 2 {
-                                 let w_str = x_split[0].split('/').next().unwrap_or("1920");
-                                 let h_str = x_split[1].split('/').next().unwrap_or("1080");
-
-                                 let w: u32 = w_str.parse().unwrap_or(1920);
-                                 let h: u32 = h_str.parse().unwrap_or(1080);
-
-                                 let name = parts.last().unwrap_or(&"Unknown").to_string();
-
-                                 monitors.push(MonitorInfo { name, width: w, height: h, x, y });
-                             }
-                         }
-                    }
-                }
-            }
+    if let Ok(display_infos) = DisplayInfo::all() {
+        for (i, info) in display_infos.iter().enumerate() {
+            monitors.push(MonitorInfo {
+                name: if info.is_primary {
+                    format!("Monitor {} (Primary)", i + 1)
+                } else {
+                    format!("Monitor {}", i + 1)
+                },
+                width: info.width,
+                height: info.height,
+                x: info.x,
+                y: info.y,
+            });
         }
     }
 
@@ -94,7 +56,8 @@ struct ScreenRecorderApp {
     filename: String,
     format: String, // "mp4", "webm"
     audio_enabled: bool,
-    audio_device: String,
+    audio_devices: Vec<String>,
+    selected_audio_device: String,
 
     // Region state
     region_custom: bool,
@@ -107,7 +70,7 @@ struct ScreenRecorderApp {
 }
 
 impl ScreenRecorderApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let monitors = get_monitors();
 
         // Default paths
@@ -117,7 +80,12 @@ impl ScreenRecorderApp {
             PathBuf::from(".")
         };
 
+        // Ensure we default to a safe monitor if something goes wrong
         let default_mon = monitors.first().unwrap();
+
+        // Initial audio scan
+        let audio_devices = recorder::get_audio_devices();
+        let selected_audio_device = audio_devices.first().cloned().unwrap_or_else(|| "default".to_string());
 
         Self {
             recorder: Recorder::new(),
@@ -127,13 +95,23 @@ impl ScreenRecorderApp {
             filename: "recording.mp4".to_string(),
             format: "mp4".to_string(),
             audio_enabled: false,
-            audio_device: "default".to_string(),
+            audio_devices,
+            selected_audio_device,
             region_custom: false,
             reg_x: default_mon.x,
             reg_y: default_mon.y,
             reg_w: default_mon.width,
             reg_h: default_mon.height,
             status_message: "Ready".to_string(),
+        }
+    }
+
+    fn refresh_audio_devices(&mut self) {
+        self.audio_devices = recorder::get_audio_devices();
+        if !self.audio_devices.contains(&self.selected_audio_device) {
+             if let Some(first) = self.audio_devices.first() {
+                 self.selected_audio_device = first.clone();
+             }
         }
     }
 }
@@ -219,9 +197,20 @@ impl eframe::App for ScreenRecorderApp {
                     if self.audio_enabled {
                         ui.horizontal(|ui| {
                             ui.label("Device:");
-                            ui.text_edit_singleline(&mut self.audio_device);
+                            egui::ComboBox::from_id_source("audio_combo")
+                                .selected_text(&self.selected_audio_device)
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for dev in &self.audio_devices {
+                                        ui.selectable_value(&mut self.selected_audio_device, dev.clone(), dev);
+                                    }
+                                });
+
+                            if ui.button("🔄").on_hover_text("Refresh Devices").clicked() {
+                                self.refresh_audio_devices();
+                            }
                         });
-                        ui.small("Hint: 'default' or 'hw:0,0' (ALSA)");
+                        ui.small("Select your input device (e.g., Microphone)");
                     }
                 });
 
@@ -266,7 +255,7 @@ impl eframe::App for ScreenRecorderApp {
                             x: self.reg_x,
                             y: self.reg_y,
                             audio_enabled: self.audio_enabled,
-                            audio_device: self.audio_device.clone(),
+                            audio_device: self.selected_audio_device.clone(),
                             container_format: self.format.clone(),
                         };
 
@@ -283,13 +272,19 @@ impl eframe::App for ScreenRecorderApp {
                         }
                     }
 
-                    if self.recorder.is_paused() {
-                        if ui.button("▶ Resume").clicked() {
-                            let _ = self.recorder.resume();
-                        }
+                    // Pause/Resume Logic
+                    if cfg!(target_os = "windows") {
+                        // Disable buttons on Windows
+                        ui.add_enabled(false, egui::Button::new("⏸ Pause")).on_disabled_hover_text("Pause is not supported on Windows");
                     } else {
-                        if ui.button("⏸ Pause").clicked() {
-                            let _ = self.recorder.pause();
+                        if self.recorder.is_paused() {
+                            if ui.button("▶ Resume").clicked() {
+                                let _ = self.recorder.resume();
+                            }
+                        } else {
+                            if ui.button("⏸ Pause").clicked() {
+                                let _ = self.recorder.pause();
+                            }
                         }
                     }
                 }
